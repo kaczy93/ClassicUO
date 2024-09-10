@@ -8,7 +8,7 @@ namespace ClassicUO.IO
     {
         private readonly MemoryMappedViewAccessor _accessor;
         private readonly MemoryMappedFile _mmf;
-        private readonly BinaryReader _file;
+        private readonly BinaryReader _reader;
 
         public MMFileReader(FileStream stream) : base(stream)
         {
@@ -30,7 +30,7 @@ namespace ClassicUO.IO
                 {
                     byte* ptr = null;
                     _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-                    _file = new BinaryReader(new UnmanagedMemoryStream(ptr, Length));
+                    _reader = new BinaryReader(new UnmanagedMemoryStream(ptr, Length));
                 }
             }
             catch
@@ -41,7 +41,7 @@ namespace ClassicUO.IO
             }
         }
 
-        public override BinaryReader Reader => _file;
+        public override BinaryReader Reader => _reader;
 
         public override void Dispose()
         {

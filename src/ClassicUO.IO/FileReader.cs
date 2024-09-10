@@ -13,10 +13,9 @@ namespace ClassicUO.IO
         protected FileReader(FileStream stream)
         {
             _stream = stream;
-            Length = stream.Length;       
         }
 
-        public long Length { get; }
+        public long Length => _stream.Length;
         public long Position => _position;
 
         public abstract BinaryReader Reader { get; }

@@ -44,28 +44,26 @@ using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Runtime.InteropServices;
 
 namespace ClassicUO.Game
 {
     public sealed class UltimaLive
     {
-        private const int STATICS_MEMORY_SIZE = 200000000;
         private const int CRC_LENGTH = 25;
         private const int LAND_BLOCK_LENGTH = 192;
 
         private static UltimaLive _UL;
 
         private static readonly char[] _pathSeparatorChars = { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
-        private uint[] _EOF;
-        private ULFileMul[] _filesIdxStatics;
-        private ULFileMul[] _filesMap;
-        private ULFileMul[] _filesStatics;
+        private ULFileWriter[] _mapWriters;
+        private ULFileWriter[] _staidxWriters;
+        private ULFileWriter[] _staticsWriters;
         private uint _SentWarning;
         private ULMapLoader _ULMap;
         private List<int> _ValidMaps = new List<int>();
         private ConcurrentQueue<(int, long, byte[])> _writequeue;
         private ushort[][] MapCRCs; //caching, to avoid excessive cpu & memory use
+        
         //WrapMapSize includes 2 different kind of values at each side of the array:
         //left - mapId (zero based value), so first map is at ZERO
         //right- we have the size of the map, values in index 0 and 1 are map REAL size x and y
@@ -102,11 +100,11 @@ namespace ClassicUO.Game
                     p.Seek(14);
                     int mapId = p.ReadUInt8();
 
-                    if (mapId >= _UL._filesMap.Length)
+                    if (mapId >= MapLoader.MAPS_COUNT)
                     {
                         if (Time.Ticks >= _UL._SentWarning)
                         {
-                            Log.Trace($"The server is requesting access to MAP: {mapId} but we only have {_UL._filesMap.Length} maps!");
+                            Log.Trace($"The server is requesting access to MAP: {mapId} but we only have {MapLoader.MAPS_COUNT} maps!");
 
                             _UL._SentWarning = Time.Ticks + 100000;
                         }
@@ -220,11 +218,11 @@ namespace ClassicUO.Game
                     p.Seek(14);
                     int mapId = p.ReadUInt8();
 
-                    if (mapId >= _UL._filesMap.Length)
+                    if (mapId >= MapLoader.MAPS_COUNT)
                     {
                         if (Time.Ticks >= _UL._SentWarning)
                         {
-                            Log.Trace($"The server is requesting access to MAP: {mapId} but we only have {_UL._filesMap.Length} maps!");
+                            Log.Trace($"The server is requesting access to MAP: {mapId} but we only have {MapLoader.MAPS_COUNT} maps!");
 
                             _UL._SentWarning = Time.Ticks + 100000;
                         }
@@ -249,13 +247,14 @@ namespace ClassicUO.Game
                         if (totalLength <= 0)
                         {
                             //update index lookup AND static size on disk (first 4 bytes lookup, next 4 is statics size)
-                            _UL._filesIdxStatics[mapId].WriteArray(index, new byte[8] { 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 });
+                            _UL._staidxWriters[mapId].WriteArray(index, new byte[8] { 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 });
 
                             Log.Trace($"writing zero length statics to index at 0x{index:X8}");
                         }
                         else
                         {
-                            var reader = _UL._filesIdxStatics[mapId];
+                            var staticFile = _UL._ULMap.GetStaticFile(mapId);
+                            var reader = staticFile.IdxFile;
                             reader.Seek(index, SeekOrigin.Begin);
 
                             uint lookup = reader.ReadUInt32();
@@ -268,14 +267,12 @@ namespace ClassicUO.Game
                             }
                             else
                             {
-                                lookup = _UL._EOF[mapId];
-                                _UL._EOF[mapId] += (uint) totalLength;
+                                lookup = (uint)staticFile.Length;
                                 Log.Trace($"writing statics to end of file at 0x{lookup:X8}, length:{totalLength}");
                             }
 
-                            _UL._filesStatics[mapId].WriteArray(lookup, staticsData);
-
-                            _UL._writequeue.Enqueue((mapId, lookup, staticsData));
+                            _UL._staticsWriters[mapId].WriteArray(lookup, staticsData);
+                            // _UL._writequeue.Enqueue((mapId, lookup, staticsData));
 
                             // TODO: stackalloc
                             //update lookup AND index length on disk
@@ -290,7 +287,7 @@ namespace ClassicUO.Game
                             idxData[7] = (byte) (totalLength >> 24);
 
                             //update lookup AND index length on disk
-                            _UL._filesIdxStatics[mapId].WriteArray(block * 12, idxData);
+                            _UL._staidxWriters[mapId].WriteArray(block * 12, idxData);
 
                             Chunk mapChunk = world.Map.GetChunk(block);
 
@@ -299,20 +296,19 @@ namespace ClassicUO.Game
                                 return;
                             }
 
-                            LinkedList<int> linkedList = mapChunk.Node?.List;
                             List<GameObject> gameObjects = new List<GameObject>();
-
+                            
                             for (int x = 0; x < 8; x++)
                             {
                                 for (int y = 0; y < 8; y++)
                                 {
                                     GameObject gameObject = mapChunk.GetHeadObject(x, y);
-
+                            
                                     while (gameObject != null)
                                     {
                                         GameObject currentGameObject = gameObject;
                                         gameObject = gameObject.TNext;
-
+                            
                                         if (!(currentGameObject is Land) && !(currentGameObject is Static))
                                         {
                                             gameObjects.Add(currentGameObject);
@@ -325,8 +321,6 @@ namespace ClassicUO.Game
                             mapChunk.Clear();
                             _UL._ULMap.ReloadBlock(mapId, block);
                             mapChunk.Load(mapId);
-
-                            //linkedList?.AddLast(c.Node);
 
                             foreach (GameObject gameObject in gameObjects)
                             {
@@ -407,7 +401,7 @@ namespace ClassicUO.Game
                     {
                         _UL._ValidMaps = validMaps;
                         MapLoader.MAPS_COUNT = sbyte.MaxValue;
-                        var mapLoader = new ULMapLoader(Client.Game.UO.FileManager, (uint)MapLoader.MAPS_COUNT);
+                        var mapLoader = new ULMapLoader(Client.Game.UO.FileManager);
 
                         //for (int i = 0; i < maps; i++)
                         for (int i = 0; i < validMaps.Count; i++)
@@ -418,19 +412,19 @@ namespace ClassicUO.Game
                         mapLoader.Load();
 
                         _UL._ULMap = mapLoader;
-                        _UL._filesMap = new ULFileMul[MapLoader.MAPS_COUNT];
-                        _UL._filesIdxStatics = new ULFileMul[MapLoader.MAPS_COUNT];
-                        _UL._filesStatics = new ULFileMul[MapLoader.MAPS_COUNT];
-                        (UOFile[], UOFileMul[], UOFileMul[]) refs = mapLoader.GetFilesReference;
+                        _UL._mapWriters = new ULFileWriter[MapLoader.MAPS_COUNT];
+                        _UL._staidxWriters = new ULFileWriter[MapLoader.MAPS_COUNT];
+                        _UL._staticsWriters = new ULFileWriter[MapLoader.MAPS_COUNT];
+                        (UOFile[] map, UOFileMul[] staidx, UOFileMul[] statics) refs = mapLoader.GetFilesReference;
 
                         for (int i = 0; i < validMaps.Count; i++)
                         {
-                            _UL._filesMap[validMaps[i]] = refs.Item1[validMaps[i]] as ULFileMul;
-                            _UL._filesIdxStatics[validMaps[i]] = refs.Item2[validMaps[i]] as ULFileMul;
-                            _UL._filesStatics[validMaps[i]] = refs.Item3[validMaps[i]] as ULFileMul;
+                            _UL._mapWriters[validMaps[i]] = new ULFileWriter(refs.map[validMaps[i]].FilePath);
+                            _UL._staidxWriters[validMaps[i]] = new ULFileWriter(refs.staidx[validMaps[i]].FilePath);
+                            _UL._staticsWriters[validMaps[i]] = new ULFileWriter(refs.statics[validMaps[i]].FilePath);
                         }
 
-                        _UL._writequeue = mapLoader._writer._toWrite;
+                        _UL._writequeue = mapLoader.StaticsWriter._toWrite;
                     }
 
                     break;
@@ -502,7 +496,7 @@ namespace ClassicUO.Game
 
             if (block >= 0 && block < mapWidthInBlocks * mapHeightInBlocks)
             {
-                _UL._filesMap[mapId].WriteArray(block * 196 + 4, landData);
+                _UL._mapWriters[mapId].WriteArray(block * 196 + 4, landData);
 
                 //instead of recalculating the CRC block 2 times, in case of terrain + statics update, we only set the actual block to ushort maxvalue, so it will be recalculated on next hash query
                 _UL.MapCRCs[mapId][block] = ushort.MaxValue;
@@ -547,8 +541,6 @@ namespace ClassicUO.Game
                         mapChunk.Clear();
                         mapChunk.Load(mapId);
 
-                        //linkedList?.AddLast(c.Node);
-
                         foreach (GameObject obj in gameObjects)
                         {
                             mapChunk.AddGameObject(obj, obj.X % 8, obj.Y % 8);
@@ -566,7 +558,10 @@ namespace ClassicUO.Game
         {
             int mapId = world.Map.Index;
 
-            var staidxReader = _UL._filesIdxStatics[mapId];
+            
+            (UOFile[] mapFiles, UOFileMul[] staidxFiles, UOFileMul[] staticsFiles) refs = _UL._ULMap.GetFilesReference;
+
+            var staidxReader = refs.staidxFiles[mapId];
             staidxReader.Seek(block * 12, SeekOrigin.Begin);
 
             uint lookup = staidxReader.ReadUInt32();
@@ -576,10 +571,10 @@ namespace ClassicUO.Game
             byte[] blockData = new byte[LAND_BLOCK_LENGTH + byteCount];
 
             //we prevent the system from reading beyond the end of file, causing an exception, if the data isn't there, we don't read it and leave the array blank, simple...
-            var mapReader = _UL._filesMap[mapId];
+            var mapReader = refs.mapFiles[mapId];
             mapReader.Seek(block * 196 + 4, SeekOrigin.Begin);
 
-            var staticsReader = _UL._filesStatics[mapId];
+            var staticsReader = refs.staticsFiles[mapId];
 
             for (int x = 0; x < 192; x++)
             {
@@ -655,22 +650,19 @@ namespace ClassicUO.Game
             return null;
         }
 
-        private sealed class ULFileMul : UOFileMul
+        private sealed class ULFileWriter : IDisposable
         {
             private readonly BinaryWriter _writer;
 
-            public ULFileMul(string file, bool isStaticMul) : base(file)
+            public ULFileWriter(string file)
             {
-                _writer = new BinaryWriter(File.Open(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite));
+                _writer = new BinaryWriter(File.Open(file, FileMode.Open, FileAccess.Write, FileShare.ReadWrite));
             }
 
-            public override void FillEntries()
-            {
-            }
 
-            public override void Dispose()
+            public void Dispose()
             {
-                Client.Game.UO.FileManager.Maps.Dispose();
+                _writer.Dispose();
             }
 
             public void WriteArray(long position, byte[] array)
@@ -684,19 +676,15 @@ namespace ClassicUO.Game
         public class ULMapLoader : MapLoader
         {
             private readonly CancellationTokenSource _feedCancel;
-            private FileStream[] _filesStaticsStream;
             private readonly Task _writerTask;
 
-            public ULMapLoader(UOFileManager fileManager, uint maps) : base(fileManager)
+            public ULMapLoader(UOFileManager fileManager) : base(fileManager)
             {
-                Initialize();
-
                 _feedCancel = new CancellationTokenSource();
-                NumMaps = maps;
                 var old = _UL.MapSizeWrapSize;
-                MapsDefaultSize = new int[NumMaps, 2];
+                MapsDefaultSize = new int[MAPS_COUNT, 2];
 
-                for (int i = 0; i < NumMaps; i++)
+                for (int i = 0; i < MAPS_COUNT; i++)
                 {
                     for (int x = 0; x < 2; x++)
                     {
@@ -704,16 +692,14 @@ namespace ClassicUO.Game
                     }
                 }
 
-                _writer = new AsyncWriterTasked(this, _feedCancel);
-
-                _writerTask = Task.Run(_writer.Loop); // new Thread(_writer.Loop) {Name = "UL_File_Writer", IsBackground = true};
+                StaticsWriter = new AsyncStaticsWriter(this, _feedCancel);
+                _writerTask = Task.Run(StaticsWriter.Loop);
             }
 
             public (UOFile[], UOFileMul[], UOFileMul[]) GetFilesReference =>
                 (_filesMap, _filesIdxStatics, _filesStatics);
 
-            private uint NumMaps { get; }
-            public readonly AsyncWriterTasked _writer;
+            public readonly AsyncStaticsWriter StaticsWriter;
 
             public override void ClearResources()
             {
@@ -728,16 +714,6 @@ namespace ClassicUO.Game
                 catch
                 {
                 }
-
-                if (_filesStaticsStream != null)
-                {
-                    for (int i = _filesStaticsStream.Length - 1; i >= 0; --i)
-                    {
-                        _filesStaticsStream[i]?.Dispose();
-                    }
-
-                    _filesStaticsStream = null;
-                }
             }
 
             public override void Load()
@@ -749,61 +725,21 @@ namespace ClassicUO.Game
 
                 Client.Game.UO.FileManager.Maps?.Dispose();
                 Client.Game.UO.FileManager.Maps = this;
+                
+                base.Load();
 
-                _UL._EOF = new uint[NumMaps];
-                _filesStaticsStream = new FileStream[NumMaps];
-                bool foundOneMap = false;
 
-                for (int x = 0; x < _UL._ValidMaps.Count; x++)
-                {
-                    int i = _UL._ValidMaps[x];
-                    string path = Path.Combine(_UL.ShardName, $"map{i}.mul");
-
-                    if (File.Exists(path))
-                    {
-                        _filesMap[i] = new ULFileMul(path, false);
-                        foundOneMap = true;
-                    }
-
-                    path = Path.Combine(_UL.ShardName, $"statics{i}.mul");
-
-                    if (!File.Exists(path))
-                    {
-                        foundOneMap = false;
-
-                        break;
-                    }
-
-                    _filesStatics[i] = new ULFileMul(path, true);
-
-                    _filesStaticsStream[i] = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-
-                    _UL._EOF[i] = (uint)new FileInfo(path).Length;
-
-                    path = Path.Combine(_UL.ShardName, $"staidx{i}.mul");
-
-                    if (!File.Exists(path))
-                    {
-                        foundOneMap = false;
-
-                        break;
-                    }
-
-                    _filesIdxStatics[i] = new ULFileMul(path, false);
-                }
-
-                if (!foundOneMap)
+                if (_UL._ValidMaps.Count <= 0)
                 {
                     throw new FileNotFoundException($"No maps, staidx or statics found on {_UL.ShardName}.");
                 }
-
-                for (int x = 0; x < _UL._ValidMaps.Count; x++)
+                
+                foreach (var mapId in _UL._ValidMaps)
                 {
-                    int i = _UL._ValidMaps[x];
-                    MapBlocksSize[i, 0] = MapsDefaultSize[i, 0] >> 3;
-                    MapBlocksSize[i, 1] = MapsDefaultSize[i, 1] >> 3;
+                    MapBlocksSize[mapId, 0] = MapsDefaultSize[mapId, 0] >> 3;
+                    MapBlocksSize[mapId, 1] = MapsDefaultSize[mapId, 1] >> 3;
                     //on ultimalive map always preload
-                    LoadMap(i);
+                    LoadMap(mapId);
                 }
             }
 
@@ -1004,7 +940,6 @@ namespace ClassicUO.Game
                 }
 
                 var mapPos = uopoffset + (ulong)(blockNumber * mapblocksize);
-                var staticIdxPos = (ulong)(block * staticidxblocksize);
                 var staticPos = 0ul;
                 var staticCount = 0u;
 
@@ -1029,40 +964,31 @@ namespace ClassicUO.Game
                 data.StaticFile = staticfile;
             }
 
-            public class AsyncWriterTasked
+            public class AsyncStaticsWriter
             {
                 private readonly ULMapLoader _Map;
                 private readonly CancellationTokenSource _token;
-                private readonly AutoResetEvent m_Signal = new AutoResetEvent(false);
+                private readonly AutoResetEvent m_Signal = new(false);
 
-                public AsyncWriterTasked(ULMapLoader map, CancellationTokenSource token)
+                public AsyncStaticsWriter(ULMapLoader map, CancellationTokenSource token)
                 {
                     _Map = map;
                     _token = token;
                 }
 
-                public readonly ConcurrentQueue<(int, long, byte[])> _toWrite = new ConcurrentQueue<(int, long, byte[])>();
+                public readonly ConcurrentQueue<(int, long, byte[])> _toWrite = new();
 
                 public void Loop()
                 {
                     while (_UL != null && !_Map.IsDisposed && !_token.IsCancellationRequested)
                     {
-                        while (_toWrite.TryDequeue(out (int, long, byte[]) deq))
+                        while (_toWrite.TryDequeue(out (int map, long pos, byte[]data ) deq))
                         {
-                            WriteArray(deq.Item1, deq.Item2, deq.Item3);
+                            _UL._staticsWriters[deq.map].WriteArray(deq.pos, deq.data);
                         }
 
                         m_Signal.WaitOne(10, false);
                     }
-                }
-
-                public void WriteArray(int map, long position, byte[] array)
-                {
-                    _Map._filesStaticsStream[map].Seek(position, SeekOrigin.Begin);
-
-                    _Map._filesStaticsStream[map].Write(array, 0, array.Length);
-
-                    _Map._filesStaticsStream[map].Flush();
                 }
             }
         }
